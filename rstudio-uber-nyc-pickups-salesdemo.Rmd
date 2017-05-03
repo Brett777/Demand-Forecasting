@@ -1,0 +1,242 @@
+---
+title: "Uber Pickups in NYC (Dynamic Inventory Management)"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+### Introduction
+The goal of this session is to give you a taste of the different features of the DataScience Platform, including conducting analyses, publishing reports, scheduling scripts, and deploying models. 
+
+Imagine that you are a data scientist at a company that has to perform dynamic inventory management. An example of that would be a ride-sharing company where you want to know which parts of a city to direct your drivers to depending on the time of day and other factors like the weather.
+
+Here we'll perform some analysis in Jupyter and then publish these findings as a Report that a business user will find easy to consume.
+
+```{r, echo = FALSE, message = FALSE}
+### Import helper_functions
+source("./helper_functions.R")
+
+### Install and import required packages
+# We are using a helper function that takes the name of a package as argument
+# Checks if it's installed and installs it if not
+# Loads the package
+# List of required packages
+package_list = c("devtools", "ggmap", "ggplot2"
+                 , "dplyr", "tidyr", "scales"
+                 , "highcharter", "leaflet", "maps", "maptools"
+                 )
+
+# Call on convenience function to install and import packages
+for (package in package_list) {
+    usePackage(package)
+}
+
+### Set plotting parameters and import color palettes
+set_ds_theme()
+```
+
+### Load data 
+The data is in data/processed_uber_nyc.RData and contains two dataframes:
+
+1. `agg_data`
+
+2. `zone_polys`
+
+```{r, echo = FALSE, message = FALSE}
+load("data/processed_uber_nyc.RData")
+```
+
+### About the data
+The source of the data for this exercise is the [Uber Pickups in New York City dataset by FiveThirtyEight](https://www.kaggle.com/fivethirtyeight/uber-pickups-in-new-york-city). Pickup data for 20 million pickeups are aggregated by hour, date, and taxi zone (i.e., an approximate neighborhood) and enriched with calendar and weather data. More detailed information about each dataframe is below.
+
+#### agg_data
+This dataframe contains information about the number of pickups.
+
+Fields:
+
+* `locationID`: unique ID for each taxi zone
+
+* `date`
+
+* `hour`: 24H format
+
+* `borough`: Borough that the zone is located in (e.g. Manhattan, Boorklyn, Queens)
+
+* `zone`: Name of the taxi zone (e.g. Times Sq, Chinatown, Central Harlem)
+
+* `picksups`: Number of pickups
+
+* `day`: Day of week (e.g. Mon, Tue, Wed)
+
+* `is_holiday`: Whether that day was a holiday (Boolean)
+
+* `mean_temp_F`: Mean temperature that day in Fahrenheit
+
+```{r, echo = FALSE}
+head(agg_data, 3)
+```
+
+#### zone_polys
+This is a dimension table that describes the boundaries of each taxi zone.
+
+Fields:
+
+* `long`: Longitude
+
+* `lat`: Latitude
+
+* `order`: Rank of point when drawing boundary
+
+* `hole`: Whether to plot a hole in that location (Boolean)
+
+* `piece`: The piece of the zone that the point is associated with
+
+* `id`: ID of zone. Same as locationID in agg_data
+
+* `group`: Group that the point belongs to
+
+```{r, echo = FALSE}
+head(zone_polys, 3)
+```
+
+### Exploratory analysis
+#### What areas experience the highest demand?
+
+```{r, echo = FALSE, warning = FALSE}
+# Calculate daily mean pickups of each taxi zone
+geo_pickups = agg_data %>%
+    group_by(locationID, date) %>%
+    summarize(day_pickups = sum(pickups)) %>%
+    group_by(locationID) %>%
+    summarize(mean_pickup = mean(day_pickups))
+
+locID_zone_dim = locID_zone_dim = unique(agg_data[, c("locationID", "zone")])
+
+pal = colorBin(palette = cont_ds_palette
+               , domain = for_leaflet$mean_pickup
+               , bins = 6)
+pop_tip = paste0(for_leaflet$zone
+                , ": "
+                 , signif(for_leaflet$mean_pickup, digits = 4)
+                , " pickups")
+
+m <- leaflet(for_leaflet) %>%
+  addPolygons(lat = for_leaflet$y
+              , lng = for_leaflet$x
+              , stroke = FALSE
+              , popup = pop_tip
+              , color = ~pal(for_leaflet$mean_pickup)
+              , fillOpacity = 0.65) %>%
+  addLegend("bottomright"
+            , pal = pal
+            , values = ~for_leaflet$mean_pickup
+            , title = "Pickups"
+            , opacity = 1) %>%
+  addProviderTiles(providers$CartoDB.Positron)
+  # addTiles(options = tileOptions(opacity = 0.9))
+m
+
+```
+
+Insights:
+
+* Lower Mahanttan experiences highest demand
+
+* Demand is also high at airports (JFK and La Guardia)
+
+* Not much activity in the outer boroughs
+
+### Feature Engineering
+It looks like many of the neighborhoods show similar pickup patterns. By clustering the neighborhoods, we will likely improve predictive and computational performance of the model.
+
+To cluster the neighborhoods, we will perform k-means clustering on the hourly pickup patterns. We will use the elbow method to pick the most suitable number of clusters.
+
+```{r, echo = FALSE}
+agg_data$day = as.factor(agg_data$day)
+agg_data$hour = as.factor(agg_data$hour)
+
+# Remove NA
+agg_data = agg_data[complete.cases(agg_data$zone), ]
+
+### Cluster zones to reduce number of levels
+hourly_pickups_zone = agg_data %>%
+  group_by(hour, locationID) %>%
+  summarize(mean_pickup = mean(pickups)) %>%
+  spread(hour, mean_pickup)
+hourly_pickups_zone[is.na(hourly_pickups_zone)] = 0
+
+zone_k_data = hourly_pickups_zone[, 2:25]
+
+# Choose best number of zone clusters by elbow method
+wss = (nrow(zone_k_data) - 1) * sum(apply(zone_k_data, 2, var))
+for (i in 2:20) {
+  wss[i] = sum(kmeans(zone_k_data
+                      , centers = i
+                      , nstart = 123
+                      , iter.max = 100)$withinss)
+}
+
+wss = data.frame(k = seq(1, 20), wss = wss)
+fntltp = JS("function(){
+            return 'Num clusters: ' + this.point.x + '<br> WSS: ' +  this.point.y;
+            }")
+
+hchart(wss
+       , "line"
+       , hcaes(x = k
+               , y = wss)
+       , color = cat_ds_palette[1]) %>%
+  hc_tooltip(
+    useHTML = TRUE,
+    formatter = fntltp
+  ) %>%
+  hc_title(text = "Sum of Squares vs. Number of Clusters") %>%
+  hc_xAxis(title = list(text = "k")) %>%
+  hc_yAxis(title = list(text = "Sum of squares"))
+```
+
+4 appears to be the most appropriate number of neighborhood clusters. Let's visualize the clusters.
+
+```{r, echo = FALSE}
+# Appears to be 4
+zone_cluster = kmeans(x = zone_k_data
+                      , centers = 4
+                      , nstart = 123
+                      , iter.max = 100)
+# Join cluster IDs with locationIDs
+hourly_pickups_zone$clusterID = zone_cluster$cluster
+zone_cluster_map = hourly_pickups_zone[, c("locationID", "clusterID")]
+
+# Prep data for plotting
+colnames(zone_k_data) = paste("hour", colnames(zone_k_data), sep = "_")
+zone_k_data$clusterID = zone_cluster_map$clusterID
+zone_k_data$clusterID = as.factor(zone_cluster_map$clusterID)
+
+# Add clusterIDs to train and test sets
+agg_data = agg_data %>%
+  left_join(zone_cluster_map, by = "locationID")
+agg_data$clusterID = as.factor(agg_data$clusterID)
+
+# Plot zone clusters
+loc_zone_dim = unique(agg_data[, c("clusterID", "locationID", "zone")])
+plot_data = cbind(zone_k_data[, c("hour_10", "hour_18", "clusterID")], zone = loc_zone_dim$zone)
+
+fntltp = JS("function(){
+             return this.point.name + ' (Cluster ' + this.series.name + ')';
+             }")
+
+hchart(plot_data
+       , "scatter"
+       , hcaes(x = hour_10
+               , y = hour_18
+               , group = clusterID
+               , name = zone)) %>%
+  hc_tooltip(
+    useHTML = TRUE,
+    formatter = fntltp
+  ) %>%
+  hc_colors(cat_ds_palette) %>%
+  hc_title(text = "Clusters of Neighborhoods Based on Hourly Pickup Patterns") %>%
+  hc_xAxis(title = list(text = "Mean pickups at 10am")) %>%
+  hc_yAxis(title = list(text = "Mean pickups at 6pm"))
+```
